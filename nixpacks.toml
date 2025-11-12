@@ -1,5 +1,4 @@
 [phases.setup]
-# System libs Chromium needs
 nixPkgs = [
   "bash","python311","chromium","nss","nspr","glib","pango","freetype","fontconfig",
   "alsa-lib","cups","libdrm","libxkbcommon","libX11","libxcb","libxcomposite",
