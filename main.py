@@ -142,9 +142,13 @@ def abs_url(base: str, href: str) -> str:
 
 # ---------- solvers ----------
 async def compute_answer(page, text: str, html: str, decoded: str, deadline: float, retry: bool=False) -> Any:
+    # bail out if almost out of time
+    if time_left(deadline) < 5:
+        return "timeout"
+
     # A) PDF on the page → sum "value" column on page 2
     pdf_url = await first_pdf_href(page)
-    if pdf_url:
+    if pdf_url and time_left(deadline) > 10:
         s = await sum_value_col_from_pdf(pdf_url, deadline)
         if s is not None:
             return s
@@ -182,6 +186,14 @@ async def compute_answer(page, text: str, html: str, decoded: str, deadline: flo
             nums = [to_num(x) for x in re.findall(r"[-+]?\d*\.?\d+", blk)]
             total = sum(n for n in nums if n is not None)
             return float(total)
+
+    # E) If instructions ask for a chart, return a PNG data URI
+    for blob in (decoded, text):
+        if blob and re.search(r"\b(chart|plot|bar\s*chart|visuali[sz]e)\b", blob, re.I):
+            nums = [to_num(x) for x in re.findall(r"[-+]?\d*\.?\d+", blob)]
+            nums = [n for n in nums if n is not None]
+            if len(nums) >= 2:
+                return render_bar_chart_png(nums[:12])  # cap bars for safety
 
     return "unable_to_determine"
 
