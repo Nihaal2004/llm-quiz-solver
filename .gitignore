@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+.env.*
+dist/
+build/
+*.log
+.playwright/
+playwright-report/
+test-results/
