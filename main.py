@@ -56,7 +56,7 @@ async def solve(request: Request, background: BackgroundTasks):
 async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float):
     deadline = t0 + 180.0
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context(ignore_https_errors=False)
         page = await context.new_page()
         current = first_url
