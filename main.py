@@ -1,6 +1,8 @@
 # main.py
-import os, time, hmac, asyncio, re, io, json, uuid, logging
-from typing import Any, Optional, Tuple
+import os, time, hmac, asyncio, re, io, json, uuid, logging, base64
+from typing import Any, Optional, Tuple, List
+from urllib.parse import urljoin
+
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
@@ -8,7 +10,7 @@ import httpx
 import pdfplumber
 import pandas as pd
 
-# ---- logging: single-line JSON for easy reading in Railway ----
+# ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("solver")
 
@@ -45,6 +47,7 @@ async def solve(request: Request, background: BackgroundTasks):
     background.add_task(run_chain, tid, email, secret, url, t0)
     return JSONResponse({"status": "accepted"})
 
+# ---------- core loop ----------
 async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float):
     deadline = t0 + 180.0
     async with async_playwright() as pw:
@@ -57,17 +60,21 @@ async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float
                 log.info(json.dumps({"ev":"visit","tid":tid,"url":current}))
                 await page.goto(current, wait_until="networkidle")
                 await page.wait_for_load_state("domcontentloaded")
+                # give late scripts a moment
+                try:
+                    await page.wait_for_function("document.body && document.body.innerText.length > 0", timeout=2000)
+                except Exception:
+                    pass
 
-                text = await page.evaluate("document.body.innerText")
-                html = await page.content()
+                text, html, decoded = await extract_instructions(page)
+                submit_url = discover_submit_url(page, text, html, decoded)
+                answer = await compute_answer(page, text, html, decoded, deadline)
 
-                submit_url = find_submit_url(text, html)
-                answer = await compute_answer(page, text, html, deadline)
                 ok, maybe_next = await submit_answer(submit_url, email, secret, current, answer)
                 log.info(json.dumps({"ev":"submit","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__}))
 
                 if not ok and not maybe_next and time.monotonic() < deadline - 10:
-                    answer = await compute_answer(page, text, html, deadline, retry=True)
+                    answer = await compute_answer(page, text, html, decoded, deadline, retry=True)
                     ok, maybe_next = await submit_answer(submit_url, email, secret, current, answer)
                     log.info(json.dumps({"ev":"retry","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__}))
 
@@ -80,64 +87,189 @@ async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float
             await browser.close()
             log.info(json.dumps({"ev":"done","tid":tid,"dur_s":round(time.monotonic()-t0,3)}))
 
-def find_submit_url(text: str, html: str) -> str:
-    m = re.search(r"https?://[^\s\"'>]+/submit[^\s\"'>]*", text, re.I)
-    if m: return m.group(0)
-    m = re.search(r"https?://[^\s\"'>]+/submit[^\s\"'>]*", html, re.I)
-    if m: return m.group(0)
-    m = re.search(r"submit[^:\n]*:\s*(https?://[^\s\"'>]+)", text, re.I)
-    if m: return m.group(1)
+# ---------- DOM + parsing helpers ----------
+async def extract_instructions(page) -> Tuple[str, str, str]:
+    """Return (visible_text, html, decoded_from_atob_or_pre)."""
+    text = await page.evaluate("document.body ? document.body.innerText : ''")
+    html = await page.content()
+
+    # gather <pre> blocks that often hold JSON hints
+    pre_text = await page.evaluate("""
+        () => Array.from(document.querySelectorAll('pre'))
+              .map(n => n.innerText).join("\\n\\n")
+    """)
+
+    # decode any atob(`...`) literal in scripts
+    scripts = await page.evaluate("""
+        () => Array.from(document.scripts).map(s => s.textContent || "")
+    """)
+    decoded_chunks: List[str] = []
+    for src in scripts:
+        for m in re.finditer(r"atob\\(`([A-Za-z0-9+/=\\n\\r]+)`\\)", src):
+            b64 = m.group(1).replace("\\n","").replace("\\r","")
+            try:
+                decoded_chunks.append(base64.b64decode(b64).decode("utf-8", "ignore"))
+            except Exception:
+                pass
+
+    decoded = "\n\n".join(([pre_text] if pre_text else []) + decoded_chunks)
+    return text, html, decoded
+
+def discover_submit_url(page, text: str, html: str, decoded: str) -> str:
+    # priority 1: explicit "... submit to https://... " phrasing
+    for blob in (decoded, text, html):
+        m = re.search(r"https?://[^\s\"'>]+/submit[^\s\"'>]*", blob or "", re.I)
+        if m:
+            return m.group(0)
+    # fallback: any URL immediately after the keyword "submit"
+    for blob in (decoded, text):
+        m = re.search(r"submit[^:\n]*[:]\s*(https?://[^\s\"'>]+)", blob or "", re.I)
+        if m:
+            return m.group(1)
+    # last resort: DOM anchors containing "submit"
+    # (we resolve relative URLs to absolute)
+    # this runs in page context to gather hrefs
+    # note: use sync wrapper via run_sync? not needed; keep simple via regex above
     raise RuntimeError("Submit URL not found")
 
-async def compute_answer(page, text: str, html: str, deadline: float, retry: bool=False) -> Any:
+def abs_url(base: str, href: str) -> str:
+    try:
+        return urljoin(base, href)
+    except Exception:
+        return href
+
+# ---------- solvers ----------
+async def compute_answer(page, text: str, html: str, decoded: str, deadline: float, retry: bool=False) -> Any:
+    # A) PDF on the page → sum "value" column on page 2
     pdf_url = await first_pdf_href(page)
     if pdf_url:
-        s = await sum_value_col_from_pdf(pdf_url)
+        s = await sum_value_col_from_pdf(pdf_url, deadline)
         if s is not None:
             return s
 
+    # B) CSV/XLSX links
+    data_link = await first_data_link(page)
+    if data_link:
+        kind, url = data_link
+        if kind == "csv":
+            return await sum_value_from_csv(url, deadline)
+        if kind == "xlsx":
+            return await sum_value_from_xlsx(url, deadline)
+
+    # C) Visible HTML tables (choose the one with a 'value' column or highest numeric density)
     try:
-        has_table = await page.evaluate("document.querySelector('table') !== null")
-        if has_table:
-            rows = await page.evaluate("""
-                () => {
-                  const t = document.querySelector('table');
-                  const rs = [...t.querySelectorAll('tr')].map(tr => [...tr.children].map(td => td.innerText.trim()));
-                  return rs;
-                }
+        has_tables = await page.evaluate("document.querySelectorAll('table').length")
+        if has_tables:
+            rows_list = await page.evaluate("""
+                () => Array.from(document.querySelectorAll('table')).map(t =>
+                    Array.from(t.querySelectorAll('tr')).map(tr =>
+                        Array.from(tr.children).map(td => td.innerText.trim())
+                    )
+                )
             """)
-            if rows and len(rows) > 1:
-                df = pd.DataFrame(rows[1:], columns=rows[0])
-                target = next((c for c in df.columns if c.strip().lower() == "value"), None)
-                if target:
-                    vals = pd.to_numeric(df[target].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
-                    return float(vals.sum())
+            best = pick_table_sum(rows_list)
+            if best is not None:
+                return float(best)
     except Exception:
         pass
 
-    blk = extract_value_block(text)
-    if blk:
-        nums = [to_num(x) for x in re.findall(r"[-+]?\d*\.?\d+", blk)]
-        total = sum(n for n in nums if n is not None)
-        return float(total)
+    # D) Text block labeled "value"
+    for blob in (decoded, text):
+        blk = extract_value_block(blob or "")
+        if blk:
+            nums = [to_num(x) for x in re.findall(r"[-+]?\d*\.?\d+", blk)]
+            total = sum(n for n in nums if n is not None)
+            return float(total)
 
     return "unable_to_determine"
+
+def pick_table_sum(all_tables: List[List[List[str]]]) -> Optional[float]:
+    best_score, best_sum = -1.0, None
+    for tbl in all_tables:
+        if not tbl or len(tbl) < 2:
+            continue
+        header = [c.strip() for c in tbl[0]]
+        # find value column (exact or fuzzy)
+        def ix():
+            for i, h in enumerate(header):
+                hlow = h.lower()
+                if hlow == "value" or "value" in hlow or hlow.endswith("value"):
+                    return i
+            return None
+        vidx = ix()
+        if vidx is None:
+            # choose numeric-dense column if no 'value'
+            cand_idx, cand_density = None, -1.0
+            for j in range(len(header)):
+                nums = 0
+                for row in tbl[1:]:
+                    if j < len(row):
+                        if re.search(r"\d", str(row[j])):
+                            nums += 1
+                density = nums / max(1, len(tbl)-1)
+                if density > cand_density:
+                    cand_idx, cand_density = j, density
+            vidx = cand_idx
+        if vidx is None:
+            continue
+        total = 0.0
+        nums = 0
+        for row in tbl[1:]:
+            cell = row[vidx] if vidx < len(row) else None
+            if isinstance(cell, str):
+                cell = cell.replace(",", "").strip()
+            try:
+                total += float(cell)
+                nums += 1
+            except Exception:
+                pass
+        score = nums  # simple: more numeric rows is better
+        if score > best_score and nums > 0:
+            best_score, best_sum = score, total
+    return best_sum
 
 async def first_pdf_href(page) -> Optional[str]:
     try:
         links = page.locator('a')
         n = await links.count()
+        best = None
         for i in range(n):
             href = await links.nth(i).get_attribute("href")
-            if href and ".pdf" in href.lower():
+            text = (await links.nth(i).inner_text()).lower() if await links.nth(i).is_visible() else ""
+            if not href:
+                continue
+            if ".pdf" in href.lower():
+                # prefer anchors labeled "download" or "data"
+                score = 2 if ("download" in text or "data" in text) else 1
                 full = await page.evaluate("(u) => new URL(u, location.href).href", href)
-                return full
+                if not best or score > best[0]:
+                    best = (score, full)
+        return best[1] if best else None
+    except Exception:
+        return None
+
+async def first_data_link(page) -> Optional[Tuple[str, str]]:
+    try:
+        links = page.locator('a')
+        n = await links.count()
+        for i in range(n):
+            href = await links.nth(i).get_attribute("href")
+            if not href:
+                continue
+            hl = href.lower()
+            if hl.endswith(".csv") or ".csv?" in hl:
+                full = await page.evaluate("(u) => new URL(u, location.href).href", href)
+                return ("csv", full)
+            if hl.endswith(".xlsx") or hl.endswith(".xls") or ".xlsx?" in hl or ".xls?" in hl:
+                full = await page.evaluate("(u) => new URL(u, location.href).href", href)
+                return ("xlsx", full)
     except Exception:
         pass
     return None
 
-async def sum_value_col_from_pdf(url: str) -> Optional[float]:
-    async with httpx.AsyncClient(timeout=60) as client:
+async def sum_value_col_from_pdf(url: str, deadline: float) -> Optional[float]:
+    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
+    async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.get(url)
         r.raise_for_status()
         data = io.BytesIO(r.content)
@@ -166,6 +298,35 @@ async def sum_value_col_from_pdf(url: str) -> Optional[float]:
     except Exception:
         return None
 
+async def sum_value_from_csv(url: str, deadline: float) -> Optional[float]:
+    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        df = pd.read_csv(io.BytesIO(r.content))
+    col = pick_value_column(df.columns)
+    if col:
+        return float(pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce").fillna(0).sum())
+    return None
+
+async def sum_value_from_xlsx(url: str, deadline: float) -> Optional[float]:
+    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        df = pd.read_excel(io.BytesIO(r.content))
+    col = pick_value_column(df.columns)
+    if col:
+        return float(pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce").fillna(0).sum())
+    return None
+
+def pick_value_column(cols) -> Optional[str]:
+    for c in cols:
+        cl = str(c).strip().lower()
+        if cl == "value" or "value" in cl:
+            return c
+    return None
+
 def extract_value_block(text: str) -> Optional[str]:
     m = re.search(r"value[^:\n]*[:\n](.+?)(?:\n\n|\Z)", text, re.I | re.S)
     return m.group(1) if m else None
@@ -178,14 +339,19 @@ def to_num(s: str) -> Optional[float]:
 
 async def submit_answer(submit_url: str, email: str, secret: str, task_url: str, answer: Any) -> Tuple[bool, Optional[str]]:
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(submit_url, json={
-            "email": email,
-            "secret": secret,
-            "url": task_url,
-            "answer": answer
-        })
-        resp.raise_for_status()
-        data = resp.json()
-        ok = bool(data.get("correct", False))
-        next_url = data.get("url")
-        return ok, next_url if isinstance(next_url, str) else None
+        try:
+            resp = await client.post(submit_url, json={
+                "email": email,
+                "secret": secret,
+                "url": task_url,
+                "answer": answer
+            })
+            resp.raise_for_status()
+            data = resp.json()
+            ok = bool(data.get("correct", False))
+            next_url = data.get("url")
+            return ok, next_url if isinstance(next_url, str) else None
+        except httpx.HTTPStatusError as e:
+            # surface server status in logs but keep flow alive
+            log.info(json.dumps({"ev":"submit_http_error","code":e.response.status_code}))
+            return False, None
