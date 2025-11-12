@@ -8,6 +8,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .
+      QUIZ_SECRET: test-secret
+      DISABLE_WORKER: '1'   # prevents launching Playwright/browser in CI
     steps:
       - uses: actions/checkout@v4
 
@@ -22,8 +26,4 @@ jobs:
           pip install pytest
 
       - name: Run tests
-        env:
-          QUIZ_SECRET: test-secret
-          DISABLE_WORKER: '1'   # prevent launching Playwright/browser in CI
-        run: |
-          pytest -q
+        run: pytest -q
