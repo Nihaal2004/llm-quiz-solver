@@ -17,6 +17,9 @@ log = logging.getLogger("solver")
 
 app = FastAPI(title="LLM Quiz Solver")
 SECRET = os.environ.get("QUIZ_SECRET", "")
+if not SECRET:
+    raise RuntimeError("QUIZ_SECRET is not set")
+
 
 def ct_equal(a: str, b: str) -> bool:
     return hmac.compare_digest(a, b)
@@ -147,11 +150,14 @@ async def compute_answer(page, text: str, html: str, decoded: str, deadline: flo
         return "timeout"
 
     # A) PDF on the page → sum "value" column on page 2
+    # A) PDF link present
     pdf_url = await first_pdf_href(page)
     if pdf_url and time_left(deadline) > 10:
-        s = await sum_value_col_from_pdf(pdf_url, deadline)
+        idx = page_index_from_text(decoded, text)
+        s = await sum_value_col_from_pdf(pdf_url, deadline, page_idx=idx)
         if s is not None:
             return s
+
 
     # B) CSV/XLSX links
     data_link = await first_data_link(page)
@@ -281,7 +287,7 @@ async def first_data_link(page) -> Optional[Tuple[str, str]]:
         pass
     return None
 
-async def sum_value_col_from_pdf(url: str, deadline: float) -> Optional[float]:
+async def sum_value_col_from_pdf(url: str, deadline: float, page_idx: int | None = None) -> Optional[float]:
     timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.get(url)
@@ -289,7 +295,7 @@ async def sum_value_col_from_pdf(url: str, deadline: float) -> Optional[float]:
         data = io.BytesIO(r.content)
     try:
         with pdfplumber.open(data) as pdf:
-            idx = 1  # page 2
+            idx = 1 if page_idx is None else page_idx
             if idx >= len(pdf.pages):
                 return None
             tbl = pdf.pages[idx].extract_table()
@@ -355,6 +361,16 @@ def time_left(deadline: float) -> float:
 
 def data_uri_from_bytes(b: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(b).decode()}"
+def page_index_from_text(*blobs: str) -> int | None:
+    for b in blobs:
+        if not b:
+            continue
+        m = re.search(r"\bpage\s+(\d+)\b", b, re.I)
+        if m:
+            n = int(m.group(1))
+            if n >= 1:
+                return n - 1  # 0-based
+    return None
 
 def render_bar_chart_png(values: list[float], labels: Optional[list[str]] = None) -> str:
     import matplotlib.pyplot as plt  # lazy import
