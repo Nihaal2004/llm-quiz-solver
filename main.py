@@ -120,22 +120,96 @@ async def extract_instructions(page) -> Tuple[str, str, str]:
     decoded = "\n\n".join(([pre_text] if pre_text else []) + decoded_chunks)
     return text, html, decoded
 
-def discover_submit_url(page, text: str, html: str, decoded: str) -> str:
-    # priority 1: explicit "... submit to https://... " phrasing
-    for blob in (decoded, text, html):
-        m = re.search(r"https?://[^\s\"'>]+/submit[^\s\"'>]*", blob or "", re.I)
-        if m:
-            return m.group(0)
-    # fallback: any URL immediately after the keyword "submit"
-    for blob in (decoded, text):
-        m = re.search(r"submit[^:\n]*[:]\s*(https?://[^\s\"'>]+)", blob or "", re.I)
-        if m:
-            return m.group(1)
-    # last resort: DOM anchors containing "submit"
-    # (we resolve relative URLs to absolute)
-    # this runs in page context to gather hrefs
-    # note: use sync wrapper via run_sync? not needed; keep simple via regex above
+def rank_urls(urls: list[str]) -> Optional[str]:
+    # pick best candidate by pattern
+    def score(u: str) -> int:
+        ul = u.lower()
+        return (
+            (100 if "/submit" in ul else 0) +
+            (40  if "submit"  in ul else 0) +
+            (20  if "answer"  in ul else 0) +
+            (10  if "api"     in ul else 0)
+        )
+    return sorted(set(urls), key=score, reverse=True)[0] if urls else None
+
+async def discover_submit_url(page, text: str, html: str, decoded: str) -> str:
+    base = await page.evaluate("location.href")
+
+    # 1) DOM-driven candidates (forms, anchors, meta, data-attrs)
+    dom_candidates = await page.evaluate("""
+      () => {
+        const abs = (u) => { try { return new URL(u, location.href).href } catch { return null } };
+        const cand = [];
+
+        // forms with action
+        document.querySelectorAll('form[action]').forEach(f=>{
+          const a=f.getAttribute('action'); if(a) cand.push(abs(a));
+        });
+
+        // anchors mentioning submit/answer/post either in href or text
+        document.querySelectorAll('a[href]').forEach(a=>{
+          const href = abs(a.getAttribute('href'));
+          const t = (a.innerText || '').toLowerCase();
+          if (!href) return;
+          if (/submit|answer|post/.test(href.toLowerCase()) || /submit|post/.test(t)) cand.push(href);
+        });
+
+        // meta/link
+        const m = document.querySelector('meta[name="submit-url"]');
+        if (m && m.content) cand.push(abs(m.content));
+        document.querySelectorAll('link[rel="submit"][href]').forEach(l=>{
+          cand.push(abs(l.getAttribute('href')));
+        });
+
+        // data attributes
+        ['data-submit','data-submit-url','data-post'].forEach(attr=>{
+          document.querySelectorAll('['+attr+']').forEach(el=>{
+            const v = el.getAttribute(attr); if (v) cand.push(abs(v));
+          });
+        });
+
+        return cand.filter(Boolean);
+      }
+    """)
+
+    # 2) From decoded <pre>/scripts (fetch/axios or explicit URL)
+    rx_any_url = r"https?://[^\s\"'>]+"
+    rx_fetch   = r"fetch\\(\\s*['\\\"](" + rx_any_url + ")"
+    rx_axios   = r"axios\\.(post|request)\\(\\s*['\\\"](" + rx_any_url + ")"
+    text_blobs = [decoded or "", html or "", text or ""]
+    code_candidates = []
+    for blob in text_blobs:
+        for m in re.finditer(rx_any_url, blob, re.I):
+            code_candidates.append(m.group(0))
+        for m in re.finditer(rx_fetch, blob, re.I):
+            code_candidates.append(m.group(1))
+        for m in re.finditer(rx_axios, blob, re.I):
+            code_candidates.append(m.group(2))
+
+    # 3) Heuristic: URL after the word “submit”
+    submit_line = []
+    for blob in (decoded or "", text or ""):
+        m = re.search(r"submit[^:\\n]*[:\\s]+(" + rx_any_url + ")", blob, re.I)
+        if m: submit_line.append(m.group(1))
+
+    # Collate & rank
+    candidates = []
+    candidates += [c for c in dom_candidates if isinstance(c, str)]
+    candidates += [c for c in code_candidates if isinstance(c, str)]
+    candidates += [c for c in submit_line if isinstance(c, str)]
+    # absolutize relatives accidentally captured (defensive)
+    absd = []
+    for c in candidates:
+        try:
+            absd.append(str(c) if c.startswith("http") else str(__import__('urllib.parse').urljoin(base, c)))
+        except Exception:
+            pass
+
+    best = rank_urls(absd)
+    if best:
+        return best
     raise RuntimeError("Submit URL not found")
+
 
 def abs_url(base: str, href: str) -> str:
     try:
