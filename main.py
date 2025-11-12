@@ -1,4 +1,5 @@
 # main.py
+import mimetypes, base64
 import os, time, hmac, asyncio, re, io, json, uuid, logging, base64
 from typing import Any, Optional, Tuple, List
 from urllib.parse import urljoin
@@ -43,7 +44,8 @@ async def solve(request: Request, background: BackgroundTasks):
 
     tid = uuid.uuid4().hex[:8]
     t0 = time.monotonic()
-    log.info(json.dumps({"ev":"accepted","tid":tid,"email":email,"url":url,"t":t0}))
+    if os.getenv("DISABLE_WORKER") == "1":   # <-- add this
+        return JSONResponse({"status": "accepted"})
     background.add_task(run_chain, tid, email, secret, url, t0)
     return JSONResponse({"status": "accepted"})
 
@@ -336,6 +338,25 @@ def to_num(s: str) -> Optional[float]:
         return float(s)
     except Exception:
         return None
+def time_left(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+def data_uri_from_bytes(b: bytes, mime: str) -> str:
+    return f"data:{mime};base64,{base64.b64encode(b).decode()}"
+
+def render_bar_chart_png(values: list[float], labels: Optional[list[str]] = None) -> str:
+    import matplotlib.pyplot as plt  # lazy import
+    fig = plt.figure()
+    x = range(len(values))
+    plt.bar(x, values)
+    if labels and len(labels) == len(values):
+        plt.xticks(list(x), labels, rotation=0)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=160)
+    plt.close(fig)
+    return data_uri_from_bytes(buf.getvalue(), "image/png")
+
 
 async def submit_answer(submit_url: str, email: str, secret: str, task_url: str, answer: Any) -> Tuple[bool, Optional[str]]:
     async with httpx.AsyncClient(timeout=30) as client:
