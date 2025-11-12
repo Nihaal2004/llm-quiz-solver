@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+.git/
+.gitignore
+.playwright/
+playwright-report/
+test-results/
+dist/
+build/
