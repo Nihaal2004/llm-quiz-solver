@@ -75,7 +75,12 @@ async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float
                 submit_url = await discover_submit_url(page, text, html, decoded)  # <- await it
                 log.info(json.dumps({"ev":"submit_url","tid":tid,"url":submit_url}))
                 answer = await compute_answer(page, text, html, decoded, deadline)
-
+                log.info(json.dumps({
+                    "ev": "answer_preview",
+                    "tid": tid,
+                    "type": type(answer).__name__,
+                    "preview": (str(answer)[:160] if answer is not None else None)
+                }))
                 ok, maybe_next = await submit_answer(submit_url, email, secret, current, answer)
                 log.info(json.dumps({"ev":"submit","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__}))
 
@@ -238,10 +243,11 @@ async def compute_answer(page, text: str, html: str, decoded: str, deadline: flo
     data_link = await first_data_link(page)
     if data_link:
         kind, url = data_link
+        instr = f"{decoded}\n{text}"
         if kind == "csv":
-            return await sum_value_from_csv(url, deadline)
+            return await sum_value_from_csv(url, deadline, instr)
         if kind == "xlsx":
-            return await sum_value_from_xlsx(url, deadline)
+            return await sum_value_from_xlsx(url, deadline, instr)
 
     # C) Visible HTML tables (choose the one with a 'value' column or highest numeric density)
     try:
@@ -393,27 +399,62 @@ async def sum_value_col_from_pdf(url: str, deadline: float, page_idx: int | None
     except Exception:
         return None
 
-async def sum_value_from_csv(url: str, deadline: float) -> Optional[float]:
+async def sum_value_from_csv(url: str, deadline: float, instr: str = "") -> Optional[float]:
     timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url)
-        r.raise_for_status()
+    headers = {"User-Agent": "llm-quiz-solver/1.0"}
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+        r = await client.get(url); r.raise_for_status()
         df = pd.read_csv(io.BytesIO(r.content))
-    col = pick_value_column(df.columns)
-    if col:
-        return float(pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce").fillna(0).sum())
+    col = pick_csv_column(df, instr)
+    if not col: return None
+    agg = pick_csv_agg(instr)
+    return apply_agg(df[col], agg)
+
+
+async def sum_value_from_xlsx(url: str, deadline: float, instr: str = "") -> Optional[float]:
+    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
+    headers = {"User-Agent": "llm-quiz-solver/1.0"}
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+        r = await client.get(url); r.raise_for_status()
+        df = pd.read_excel(io.BytesIO(r.content))
+    col = pick_csv_column(df, instr)
+    if not col: return None
+    agg = pick_csv_agg(instr)
+    return apply_agg(df[col], agg)
+
+def pick_csv_agg(instructions: str) -> str:
+    s = (instructions or "").lower()
+    if re.search(r"\b(mean|average|avg)\b", s):   return "mean"
+    if re.search(r"\b(median)\b", s):             return "median"
+    if re.search(r"\b(max(imum)?|largest|highest)\b", s): return "max"
+    if re.search(r"\b(min(imum)?|smallest|lowest)\b", s): return "min"
+    if re.search(r"\b(count)\b", s):              return "count"
+    return "sum"
+
+def pick_csv_column(df: pd.DataFrame, instructions: str) -> Optional[str]:
+    s = (instructions or "").lower()
+    # prefer a named column mentioned in the instructions
+    for c in df.columns:
+        if str(c).strip().lower() in s:
+            return c
+    # fallbacks: common names or first numeric-ish column
+    for name in ["value", "amount", "score", "val"]:
+        if name in [str(c).strip().lower() for c in df.columns]:
+            return df.columns[[str(c).strip().lower() for c in df.columns].index(name)]
+    for c in df.columns:
+        ser = pd.to_numeric(df[c], errors="coerce")
+        if ser.notna().mean() > 0.6:  # mostly numeric
+            return c
     return None
 
-async def sum_value_from_xlsx(url: str, deadline: float) -> Optional[float]:
-    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        df = pd.read_excel(io.BytesIO(r.content))
-    col = pick_value_column(df.columns)
-    if col:
-        return float(pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce").fillna(0).sum())
-    return None
+def apply_agg(series: pd.Series, agg: str) -> float | int:
+    ser = pd.to_numeric(series, errors="coerce")
+    if agg == "mean":   return float(ser.mean())
+    if agg == "median": return float(ser.median())
+    if agg == "max":    return float(ser.max())
+    if agg == "min":    return float(ser.min())
+    if agg == "count":  return int(ser.count())
+    return float(ser.sum())
 
 def pick_value_column(cols) -> Optional[str]:
     for c in cols:
@@ -476,6 +517,15 @@ async def submit_answer(submit_url: str, email: str, secret: str, task_url: str,
             next_url = data.get("url")
             return ok, next_url if isinstance(next_url, str) else None
         except httpx.HTTPStatusError as e:
-            # surface server status in logs but keep flow alive
-            log.info(json.dumps({"ev":"submit_http_error","code":e.response.status_code}))
+            body = None
+            try:
+                body = e.response.text
+            except Exception:
+                pass
+            log.info(json.dumps({
+                "ev": "submit_http_error",
+                "code": e.response.status_code,
+                "body": (body[:500] if body else None)
+            }))
             return False, None
+ 
