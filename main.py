@@ -1,5 +1,5 @@
 # main.py
-import mimetypes, base64
+# replace the top imports with:
 import os, time, hmac, asyncio, re, io, json, uuid, logging, base64
 from typing import Any, Optional, Tuple, List
 from urllib.parse import urljoin
@@ -81,14 +81,18 @@ async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float
                     "type": type(answer).__name__,
                     "preview": (str(answer)[:160] if answer is not None else None)
                 }))
+                # in run_chain(...)
                 ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
                 log.info(json.dumps({"ev":"submit","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
 
-                # on retry: 
-                ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
-                log.info(json.dumps({"ev":"retry","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
+                if (not ok) and (not maybe_next) and time_left(deadline) > 10:
+                    answer = await compute_answer(page, text, html, decoded, deadline, retry=True)
+                    log.info(json.dumps({"ev":"answer_preview_retry","tid":tid,"type":type(answer).__name__,"preview": (str(answer)[:160] if answer is not None else None)}))
+                    ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
+                    log.info(json.dumps({"ev":"retry","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
 
                 current = maybe_next
+
 
         except Exception as e:
             log.info(json.dumps({"ev":"error","tid":tid,"msg":str(e)}))
