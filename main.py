@@ -232,45 +232,58 @@ async def csv_answer(url: str, deadline: float, instr: str, mode: str="best") ->
     timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
     async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent":"llm-quiz-solver/1.0"}) as client:
         r = await client.get(url); r.raise_for_status()
-        df = pd.read_csv(io.BytesIO(r.content))
+        buf = r.content
+
+    # Try normal header
+    df = pd.read_csv(io.BytesIO(buf))
+    # If headers look numeric, reload as no-header
+    cols_str = [str(c).strip().lower() for c in df.columns]
+    if cols_str and all(re.fullmatch(r"\d+", c) for c in cols_str):
+        df = pd.read_csv(io.BytesIO(buf), header=None)
+
+    if mode == "sum_all":
+        num = df.apply(pd.to_numeric, errors="coerce")
+        return float(num.fillna(0).to_numpy().sum())
+
+    # best: infer a single column + agg
     col = pick_csv_column(df, instr)
     if not col:
+        # fallback: first mostly-numeric column
+        for c in df.columns:
+            ser = pd.to_numeric(df[c], errors="coerce")
+            if ser.notna().mean() > 0.6:
+                col = c; break
+    if not col:
         return None
-    if mode == "bundle":
-        ser = pd.to_numeric(df[col], errors="coerce")
-        return {
-            "sum":   float(ser.sum()),
-            "mean":  float(ser.mean()),
-            "median": float(ser.median()),
-            "max":   float(ser.max()),
-            "min":   float(ser.min()),
-            "count": int(ser.count()),
-            "column": str(col),
-        }
     agg = pick_csv_agg(instr)
     return apply_agg(df[col], agg)
+
 
 async def xlsx_answer(url: str, deadline: float, instr: str, mode: str="best") -> Any:
     timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
     async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent":"llm-quiz-solver/1.0"}) as client:
         r = await client.get(url); r.raise_for_status()
-        df = pd.read_excel(io.BytesIO(r.content))
+        buf = r.content
+
+    df = pd.read_excel(io.BytesIO(buf), header=0)
+    if all(re.fullmatch(r"\d+", str(c).strip().lower()) for c in df.columns):
+        df = pd.read_excel(io.BytesIO(buf), header=None)
+
+    if mode == "sum_all":
+        num = df.apply(pd.to_numeric, errors="coerce")
+        return float(num.fillna(0).to_numpy().sum())
+
     col = pick_csv_column(df, instr)
     if not col:
+        for c in df.columns:
+            ser = pd.to_numeric(df[c], errors="coerce")
+            if ser.notna().mean() > 0.6:
+                col = c; break
+    if not col:
         return None
-    if mode == "bundle":
-        ser = pd.to_numeric(df[col], errors="coerce")
-        return {
-            "sum":   float(ser.sum()),
-            "mean":  float(ser.mean()),
-            "median": float(ser.median()),
-            "max":   float(ser.max()),
-            "min":   float(ser.min()),
-            "count": int(ser.count()),
-            "column": str(col),
-        }
     agg = pick_csv_agg(instr)
     return apply_agg(df[col], agg)
+
 
 async def compute_answer(page, text: str, html: str, decoded: str, deadline: float, retry: bool=False) -> Any:
     # bail out if almost out of time
@@ -294,9 +307,10 @@ async def compute_answer(page, text: str, html: str, decoded: str, deadline: flo
         kind, url = data_link
         instr = f"{decoded}\n{text}"
         if kind == "csv":
-            return await csv_answer(url, deadline, instr, mode=("best" if not retry else "bundle"))
+            return await csv_answer(url, deadline, instr, mode=("best" if not retry else "sum_all"))
         if kind == "xlsx":
-            return await xlsx_answer(url, deadline, instr, mode=("best" if not retry else "bundle"))
+            return await xlsx_answer(url, deadline, instr, mode=("best" if not retry else "sum_all"))
+
 
 
     # C) Visible HTML tables (choose the one with a 'value' column or highest numeric density)
