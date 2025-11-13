@@ -72,7 +72,8 @@ async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float
                     pass
 
                 text, html, decoded = await extract_instructions(page)
-                submit_url = discover_submit_url(page, text, html, decoded)
+                submit_url = await discover_submit_url(page, text, html, decoded)  # <- await it
+                log.info(json.dumps({"ev":"submit_url","tid":tid,"url":submit_url}))
                 answer = await compute_answer(page, text, html, decoded, deadline)
 
                 ok, maybe_next = await submit_answer(submit_url, email, secret, current, answer)
@@ -110,7 +111,7 @@ async def extract_instructions(page) -> Tuple[str, str, str]:
     """)
     decoded_chunks: List[str] = []
     for src in scripts:
-        for m in re.finditer(r"atob\\(`([A-Za-z0-9+/=\\n\\r]+)`\\)", src):
+        for m in re.finditer(r"atob\(`([A-Za-z0-9+/=\n\r]+)`\)", src):
             b64 = m.group(1).replace("\\n","").replace("\\r","")
             try:
                 decoded_chunks.append(base64.b64decode(b64).decode("utf-8", "ignore"))
@@ -174,8 +175,8 @@ async def discover_submit_url(page, text: str, html: str, decoded: str) -> str:
 
     # 2) From decoded <pre>/scripts (fetch/axios or explicit URL)
     rx_any_url = r"https?://[^\s\"'>]+"
-    rx_fetch   = r"fetch\\(\\s*['\\\"](" + rx_any_url + ")"
-    rx_axios   = r"axios\\.(post|request)\\(\\s*['\\\"](" + rx_any_url + ")"
+    rx_fetch   = r"fetch\(\s*['\"](" + rx_any_url + ")"
+    rx_axios   = r"axios\.(post|request)\(\s*['\"](" + rx_any_url + ")"
     text_blobs = [decoded or "", html or "", text or ""]
     code_candidates = []
     for blob in text_blobs:
@@ -189,7 +190,7 @@ async def discover_submit_url(page, text: str, html: str, decoded: str) -> str:
     # 3) Heuristic: URL after the word “submit”
     submit_line = []
     for blob in (decoded or "", text or ""):
-        m = re.search(r"submit[^:\\n]*[:\\s]+(" + rx_any_url + ")", blob, re.I)
+        m = re.search(r"submit[^:\n]*[:\s]+(" + rx_any_url + ")", blob, re.I)
         if m: submit_line.append(m.group(1))
 
     # Collate & rank
