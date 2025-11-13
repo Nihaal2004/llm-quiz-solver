@@ -3,7 +3,7 @@ import mimetypes, base64
 import os, time, hmac, asyncio, re, io, json, uuid, logging, base64
 from typing import Any, Optional, Tuple, List
 from urllib.parse import urljoin
-
+from typing import Tuple, Optional, Any
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
@@ -81,13 +81,12 @@ async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float
                     "type": type(answer).__name__,
                     "preview": (str(answer)[:160] if answer is not None else None)
                 }))
-                ok, maybe_next = await submit_answer(submit_url, email, secret, current, answer)
-                log.info(json.dumps({"ev":"submit","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__}))
+                ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
+                log.info(json.dumps({"ev":"submit","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
 
-                if not ok and not maybe_next and time.monotonic() < deadline - 10:
-                    answer = await compute_answer(page, text, html, decoded, deadline, retry=True)
-                    ok, maybe_next = await submit_answer(submit_url, email, secret, current, answer)
-                    log.info(json.dumps({"ev":"retry","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__}))
+                # on retry: 
+                ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
+                log.info(json.dumps({"ev":"retry","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
 
                 current = maybe_next
 
@@ -224,6 +223,51 @@ def abs_url(base: str, href: str) -> str:
         return href
 
 # ---------- solvers ----------
+
+async def csv_answer(url: str, deadline: float, instr: str, mode: str="best") -> Any:
+    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
+    async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent":"llm-quiz-solver/1.0"}) as client:
+        r = await client.get(url); r.raise_for_status()
+        df = pd.read_csv(io.BytesIO(r.content))
+    col = pick_csv_column(df, instr)
+    if not col:
+        return None
+    if mode == "bundle":
+        ser = pd.to_numeric(df[col], errors="coerce")
+        return {
+            "sum":   float(ser.sum()),
+            "mean":  float(ser.mean()),
+            "median": float(ser.median()),
+            "max":   float(ser.max()),
+            "min":   float(ser.min()),
+            "count": int(ser.count()),
+            "column": str(col),
+        }
+    agg = pick_csv_agg(instr)
+    return apply_agg(df[col], agg)
+
+async def xlsx_answer(url: str, deadline: float, instr: str, mode: str="best") -> Any:
+    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
+    async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent":"llm-quiz-solver/1.0"}) as client:
+        r = await client.get(url); r.raise_for_status()
+        df = pd.read_excel(io.BytesIO(r.content))
+    col = pick_csv_column(df, instr)
+    if not col:
+        return None
+    if mode == "bundle":
+        ser = pd.to_numeric(df[col], errors="coerce")
+        return {
+            "sum":   float(ser.sum()),
+            "mean":  float(ser.mean()),
+            "median": float(ser.median()),
+            "max":   float(ser.max()),
+            "min":   float(ser.min()),
+            "count": int(ser.count()),
+            "column": str(col),
+        }
+    agg = pick_csv_agg(instr)
+    return apply_agg(df[col], agg)
+
 async def compute_answer(page, text: str, html: str, decoded: str, deadline: float, retry: bool=False) -> Any:
     # bail out if almost out of time
     if time_left(deadline) < 5:
@@ -240,14 +284,16 @@ async def compute_answer(page, text: str, html: str, decoded: str, deadline: flo
 
 
     # B) CSV/XLSX links
+    # inside compute_answer(...)
     data_link = await first_data_link(page)
     if data_link:
         kind, url = data_link
         instr = f"{decoded}\n{text}"
         if kind == "csv":
-            return await sum_value_from_csv(url, deadline, instr)
+            return await csv_answer(url, deadline, instr, mode=("best" if not retry else "bundle"))
         if kind == "xlsx":
-            return await sum_value_from_xlsx(url, deadline, instr)
+            return await xlsx_answer(url, deadline, instr, mode=("best" if not retry else "bundle"))
+
 
     # C) Visible HTML tables (choose the one with a 'value' column or highest numeric density)
     try:
@@ -428,22 +474,21 @@ def pick_csv_agg(instructions: str) -> str:
     if re.search(r"\b(median)\b", s):             return "median"
     if re.search(r"\b(max(imum)?|largest|highest)\b", s): return "max"
     if re.search(r"\b(min(imum)?|smallest|lowest)\b", s): return "min"
-    if re.search(r"\b(count)\b", s):              return "count"
+    if re.search(r"\bcount\b", s):                return "count"
     return "sum"
 
 def pick_csv_column(df: pd.DataFrame, instructions: str) -> Optional[str]:
     s = (instructions or "").lower()
-    # prefer a named column mentioned in the instructions
-    for c in df.columns:
-        if str(c).strip().lower() in s:
+    cols_lower = [str(c).strip().lower() for c in df.columns]
+    for i, c in enumerate(df.columns):
+        if cols_lower[i] in s:
             return c
-    # fallbacks: common names or first numeric-ish column
-    for name in ["value", "amount", "score", "val"]:
-        if name in [str(c).strip().lower() for c in df.columns]:
-            return df.columns[[str(c).strip().lower() for c in df.columns].index(name)]
+    for name in ["value","amount","score","val"]:
+        if name in cols_lower:
+            return df.columns[cols_lower.index(name)]
     for c in df.columns:
         ser = pd.to_numeric(df[c], errors="coerce")
-        if ser.notna().mean() > 0.6:  # mostly numeric
+        if ser.notna().mean() > 0.6:
             return c
     return None
 
@@ -455,6 +500,7 @@ def apply_agg(series: pd.Series, agg: str) -> float | int:
     if agg == "min":    return float(ser.min())
     if agg == "count":  return int(ser.count())
     return float(ser.sum())
+
 
 def pick_value_column(cols) -> Optional[str]:
     for c in cols:
@@ -501,8 +547,7 @@ def render_bar_chart_png(values: list[float], labels: Optional[list[str]] = None
     plt.close(fig)
     return data_uri_from_bytes(buf.getvalue(), "image/png")
 
-
-async def submit_answer(submit_url: str, email: str, secret: str, task_url: str, answer: Any) -> Tuple[bool, Optional[str]]:
+async def submit_answer(submit_url: str, email: str, secret: str, task_url: str, answer: Any) -> Tuple[bool, Optional[str], Optional[str]]:
     async with httpx.AsyncClient(timeout=30) as client:
         try:
             resp = await client.post(submit_url, json={
@@ -515,17 +560,14 @@ async def submit_answer(submit_url: str, email: str, secret: str, task_url: str,
             data = resp.json()
             ok = bool(data.get("correct", False))
             next_url = data.get("url")
-            return ok, next_url if isinstance(next_url, str) else None
+            reason = data.get("reason")
+            return ok, (next_url if isinstance(next_url, str) else None), (str(reason) if reason is not None else None)
         except httpx.HTTPStatusError as e:
             body = None
             try:
                 body = e.response.text
             except Exception:
                 pass
-            log.info(json.dumps({
-                "ev": "submit_http_error",
-                "code": e.response.status_code,
-                "body": (body[:500] if body else None)
-            }))
-            return False, None
+            log.info(json.dumps({"ev":"submit_http_error","code":e.response.status_code,"body": (body[:500] if body else None)}))
+            return False, None, None
  
