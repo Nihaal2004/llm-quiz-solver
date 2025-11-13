@@ -76,21 +76,37 @@ async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float
                 log.info(json.dumps({"ev":"submit_url","tid":tid,"url":submit_url}))
                 answer = await compute_answer(page, text, html, decoded, deadline)
                 log.info(json.dumps({
-                    "ev": "answer_preview",
-                    "tid": tid,
+                    "ev": "answer_preview", "tid": tid,
                     "type": type(answer).__name__,
                     "preview": (str(answer)[:160] if answer is not None else None)
                 }))
-                # in run_chain(...)
+                if answer is None:
+                    answer = "unable_to_determine"
+
                 ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
-                log.info(json.dumps({"ev":"submit","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
+                # in run_chain(...)
+                log.info(json.dumps({
+                    "ev": "submit", "tid": tid, "ok": ok, "next": maybe_next,
+                    "ans_type": type(answer).__name__,
+                    "reason": (reason[:200] if reason else None)
+                }))
 
                 if (not ok) and (not maybe_next) and time_left(deadline) > 10:
                     answer = await compute_answer(page, text, html, decoded, deadline, retry=True)
-                    log.info(json.dumps({"ev":"answer_preview_retry","tid":tid,"type":type(answer).__name__,"preview": (str(answer)[:160] if answer is not None else None)}))
-                    ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
-                    log.info(json.dumps({"ev":"retry","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
+                    log.info(json.dumps({
+                        "ev": "answer_preview_retry", "tid": tid,
+                        "type": type(answer).__name__,
+                        "preview": (str(answer)[:160] if answer is not None else None)
+                    }))
+                    if answer is None:
+                        answer = "unable_to_determine"
 
+                    ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
+                    log.info(json.dumps({
+                        "ev": "retry", "tid": tid, "ok": ok, "next": maybe_next,
+                        "ans_type": type(answer).__name__,
+                        "reason": (reason[:200] if reason else None)
+                    }))
                 current = maybe_next
 
 
