@@ -72,42 +72,42 @@ async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float
                     pass
 
                 text, html, decoded = await extract_instructions(page)
+                log.info(json.dumps({"ev":"instr","tid":tid,"text": (text[:220] if text else None),"decoded": (decoded[:220] if decoded else None)}))
                 submit_url = await discover_submit_url(page, text, html, decoded)  # <- await it
                 log.info(json.dumps({"ev":"submit_url","tid":tid,"url":submit_url}))
-                answer = await compute_answer(page, text, html, decoded, deadline)
-                log.info(json.dumps({
-                    "ev": "answer_preview", "tid": tid,
-                    "type": type(answer).__name__,
-                    "preview": (str(answer)[:160] if answer is not None else None)
-                }))
-                if answer is None:
-                    answer = "unable_to_determine"
-
                 ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
-                # in run_chain(...)
-                log.info(json.dumps({
-                    "ev": "submit", "tid": tid, "ok": ok, "next": maybe_next,
-                    "ans_type": type(answer).__name__,
-                    "reason": (reason[:200] if reason else None)
-                }))
+                log.info(json.dumps({"ev":"submit","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
 
+                # If specifically a wrong-sum case on a CSV/XLSX page, try bounded alternatives
+                if (not ok) and (not maybe_next) and reason and ("Wrong sum of numbers" in str(reason)) and time_left(deadline) > 10:
+                    # re-detect data link and enumerate candidates
+                    data_link = await first_data_link(page)
+                    instr = f"{decoded}\n{text}"
+                    if data_link:
+                        kind, url = data_link
+                        if kind == "csv":
+                            cands = await enumerate_csv_candidates(url, deadline, instr)
+                        elif kind == "xlsx":
+                            cands = await enumerate_xlsx_candidates(url, deadline, instr)
+                        else:
+                            cands = []
+                        for cand in cands:
+                            ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, cand)
+                            log.info(json.dumps({"ev":"alt","tid":tid,"cand":cand,"ok":ok,"next":maybe_next,"reason": (reason[:200] if reason else None)}))
+                            if ok or maybe_next:
+                                break
+
+                # Final single recompute (non-CSV paths) if still stuck
                 if (not ok) and (not maybe_next) and time_left(deadline) > 10:
                     answer = await compute_answer(page, text, html, decoded, deadline, retry=True)
-                    log.info(json.dumps({
-                        "ev": "answer_preview_retry", "tid": tid,
-                        "type": type(answer).__name__,
-                        "preview": (str(answer)[:160] if answer is not None else None)
-                    }))
+                    log.info(json.dumps({"ev":"answer_preview_retry","tid":tid,"type":type(answer).__name__,"preview": (str(answer)[:160] if answer is not None else None)}))
                     if answer is None:
                         answer = "unable_to_determine"
-
                     ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
-                    log.info(json.dumps({
-                        "ev": "retry", "tid": tid, "ok": ok, "next": maybe_next,
-                        "ans_type": type(answer).__name__,
-                        "reason": (reason[:200] if reason else None)
-                    }))
+                    log.info(json.dumps({"ev":"retry","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
+
                 current = maybe_next
+
 
 
         except Exception as e:
@@ -241,6 +241,76 @@ def abs_url(base: str, href: str) -> str:
         return urljoin(base, href)
     except Exception:
         return href
+# ---- CSV/XLSX exhaustive candidates ----
+async def _load_csv_df(buf: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(buf))
+    cols = [str(c).strip().lower() for c in df.columns]
+    if cols and all(re.fullmatch(r"\d+", c) for c in cols):
+        # looks like numeric “headers” -> treat as no header
+        df = pd.read_csv(io.BytesIO(buf), header=None)
+    return df
+
+async def _load_xlsx_df(buf: bytes) -> pd.DataFrame:
+    df = pd.read_excel(io.BytesIO(buf), header=0)
+    cols = [str(c).strip().lower() for c in df.columns]
+    if cols and all(re.fullmatch(r"\d+", c) for c in cols):
+        df = pd.read_excel(io.BytesIO(buf), header=None)
+    return df
+
+def _numeric_col_sums(df: pd.DataFrame) -> list[tuple[str, float]]:
+    out = []
+    for c in df.columns:
+        ser = pd.to_numeric(df[c], errors="coerce")
+        if ser.notna().mean() > 0.6:
+            out.append((str(c), float(ser.fillna(0).sum())))
+    # stable order: prioritize common names first
+    priority = {"value":0, "amount":1, "score":2, "val":3}
+    out.sort(key=lambda t: priority.get(str(t[0]).strip().lower(), 100))
+    return out
+
+async def enumerate_csv_candidates(url: str, deadline: float, instr: str) -> list[float]:
+    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
+    async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent":"llm-quiz-solver/1.0"}) as client:
+        r = await client.get(url); r.raise_for_status()
+        buf = r.content
+    df = await _load_csv_df(buf)
+    # 1) instruction-targeted column (if any)
+    targeted = pick_csv_column(df, instr)
+    vals: list[float] = []
+    if targeted:
+        ser = pd.to_numeric(df[targeted], errors="coerce")
+        vals.append(float(ser.fillna(0).sum()))
+    # 2) per-column numeric sums
+    for _, s in _numeric_col_sums(df):
+        vals.append(float(s))
+    # 3) whole-sheet sum as last resort
+    vals.append(float(df.apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy().sum()))
+    # dedupe while keeping order
+    seen = set(); uniq = []
+    for v in vals:
+        if v not in seen:
+            seen.add(v); uniq.append(v)
+    return uniq[:6]  # cap attempts
+
+async def enumerate_xlsx_candidates(url: str, deadline: float, instr: str) -> list[float]:
+    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
+    async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent":"llm-quiz-solver/1.0"}) as client:
+        r = await client.get(url); r.raise_for_status()
+        buf = r.content
+    df = await _load_xlsx_df(buf)
+    targeted = pick_csv_column(df, instr)
+    vals: list[float] = []
+    if targeted:
+        ser = pd.to_numeric(df[targeted], errors="coerce")
+        vals.append(float(ser.fillna(0).sum()))
+    for _, s in _numeric_col_sums(df):
+        vals.append(float(s))
+    vals.append(float(df.apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy().sum()))
+    seen = set(); uniq = []
+    for v in vals:
+        if v not in seen:
+            seen.add(v); uniq.append(v)
+    return uniq[:6]
 
 # ---------- solvers ----------
 
@@ -479,28 +549,7 @@ async def sum_value_col_from_pdf(url: str, deadline: float, page_idx: int | None
     except Exception:
         return None
 
-async def sum_value_from_csv(url: str, deadline: float, instr: str = "") -> Optional[float]:
-    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
-    headers = {"User-Agent": "llm-quiz-solver/1.0"}
-    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-        r = await client.get(url); r.raise_for_status()
-        df = pd.read_csv(io.BytesIO(r.content))
-    col = pick_csv_column(df, instr)
-    if not col: return None
-    agg = pick_csv_agg(instr)
-    return apply_agg(df[col], agg)
 
-
-async def sum_value_from_xlsx(url: str, deadline: float, instr: str = "") -> Optional[float]:
-    timeout = min(30, max(5, int(deadline - time.monotonic() - 5)))
-    headers = {"User-Agent": "llm-quiz-solver/1.0"}
-    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-        r = await client.get(url); r.raise_for_status()
-        df = pd.read_excel(io.BytesIO(r.content))
-    col = pick_csv_column(df, instr)
-    if not col: return None
-    agg = pick_csv_agg(instr)
-    return apply_agg(df[col], agg)
 
 def pick_csv_agg(instructions: str) -> str:
     s = (instructions or "").lower()
