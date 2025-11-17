@@ -10,6 +10,7 @@ from playwright.async_api import async_playwright
 import httpx
 import pdfplumber
 import pandas as pd
+import numpy as np
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -75,6 +76,13 @@ async def run_chain(tid: str, email: str, secret: str, first_url: str, t0: float
                 log.info(json.dumps({"ev":"instr","tid":tid,"text": (text[:220] if text else None),"decoded": (decoded[:220] if decoded else None)}))
                 submit_url = await discover_submit_url(page, text, html, decoded)  # <- await it
                 log.info(json.dumps({"ev":"submit_url","tid":tid,"url":submit_url}))
+                
+                # Compute the answer
+                answer = await compute_answer(page, text, html, decoded, deadline, retry=False)
+                log.info(json.dumps({"ev":"answer_preview","tid":tid,"type":type(answer).__name__,"preview": (str(answer)[:160] if answer is not None else None)}))
+                if answer is None:
+                    answer = "unable_to_determine"
+                
                 ok, maybe_next, reason = await submit_answer(submit_url, email, secret, current, answer)
                 log.info(json.dumps({"ev":"submit","tid":tid,"ok":ok,"next":maybe_next,"ans_type":type(answer).__name__,"reason": (reason[:200] if reason else None)}))
 
@@ -241,6 +249,87 @@ def abs_url(base: str, href: str) -> str:
         return urljoin(base, href)
     except Exception:
         return href
+
+async def check_scrape_task(current_url: str, instructions: str, deadline: float, page=None) -> Optional[str]:
+    """Check if instructions ask to scrape a page for a secret/code."""
+    if not instructions:
+        return None
+    
+    # Look for patterns like: "Scrape /path" or "Get the secret code from /path"
+    # Match: relative URLs starting with / or full URLs
+    scrape_patterns = [
+        r"scrape\s+([/\w\-?=&.@%]+)",  # "Scrape /demo-scrape-data?email=..."
+        r"get[^/\n]*from\s+([/\w\-?=&.@%]+)",  # "Get ... from /path"
+    ]
+    
+    for pattern in scrape_patterns:
+        match = re.search(pattern, instructions, re.I)
+        if match:
+            relative_path = match.group(1).strip()
+            # Build absolute URL
+            scrape_url = abs_url(current_url, relative_path)
+            
+            # Try using Playwright first if page is available (for JS-rendered content)
+            if page:
+                try:
+                    timeout_val = min(10000, max(3000, int(time_left(deadline) * 1000 - 3000)))
+                    await page.goto(scrape_url, wait_until="networkidle", timeout=timeout_val)
+                    await page.wait_for_load_state("domcontentloaded")
+                    # Wait a bit for JS to execute
+                    await asyncio.sleep(0.5)
+                    content = await page.evaluate("document.body ? document.body.innerText : ''")
+                    
+                    # Look for secret code in the rendered content
+                    # Try: Pattern like "Secret code is XXX" or "code is XXX"
+                    secret_is = re.search(r"(?:secret\s*code|code)\s+is\s+([A-Za-z0-9\-_]+)", content, re.I)
+                    if secret_is:
+                        return secret_is.group(1).strip()
+                    
+                    # Try: explicit "secret code:" or "code:" or "secret:" labels
+                    secret_match = re.search(r"(?:secret\s*code|secret|code)[^:\n]*[:\s]+([A-Za-z0-9\-_]{4,32})", content, re.I)
+                    if secret_match:
+                        candidate = secret_match.group(1).strip()
+                        # Skip common HTML/text words
+                        if candidate.lower() not in ['question', 'answer', 'submit', 'button', 'text', 'data', 'page', 'code', 'secret', 'and', 'not']:
+                            return candidate
+                    
+                    # Try: any standalone alphanumeric code (8-32 chars, not too common)
+                    for code_match in re.finditer(r"\b([A-Za-z0-9\-_]{8,32})\b", content):
+                        candidate = code_match.group(1).strip()
+                        if candidate.lower() not in ['question', 'answer', 'submit', 'button', 'document', 'function', 'javascript', 'template', 'demo-scrape']:
+                            return candidate
+                except Exception:
+                    pass
+            
+            # Fallback to httpx for static content
+            try:
+                timeout = min(10, max(3, int(time_left(deadline) - 3)))
+                async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent":"llm-quiz-solver/1.0"}) as client:
+                    r = await client.get(scrape_url)
+                    r.raise_for_status()
+                    content = r.text
+                    
+                    # Same patterns as above
+                    secret_is = re.search(r"(?:secret\s*code|code)\s+is\s+([A-Za-z0-9\-_]+)", content, re.I)
+                    if secret_is:
+                        return secret_is.group(1).strip()
+                    
+                    secret_match = re.search(r"(?:secret\s*code|secret|code)[^:\n]*[:\s]+([A-Za-z0-9\-_]{4,32})", content, re.I)
+                    if secret_match:
+                        candidate = secret_match.group(1).strip()
+                        if candidate.lower() not in ['question', 'answer', 'submit', 'button', 'text', 'data', 'page', 'code', 'secret', 'and', 'not']:
+                            return candidate
+                    
+                    for code_match in re.finditer(r"\b([A-Za-z0-9\-_]{8,32})\b", content):
+                        candidate = code_match.group(1).strip()
+                        if candidate.lower() not in ['question', 'answer', 'submit', 'button', 'document', 'function', 'javascript', 'template', 'demo-scrape']:
+                            return candidate
+                        
+            except Exception:
+                pass
+    
+    return None
+
 # ---- CSV/XLSX exhaustive candidates ----
 async def _load_csv_df(buf: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(buf))
@@ -274,17 +363,35 @@ async def enumerate_csv_candidates(url: str, deadline: float, instr: str) -> lis
         r = await client.get(url); r.raise_for_status()
         buf = r.content
     df = await _load_csv_df(buf)
+    
+    # Extract cutoff if present
+    cutoff = extract_cutoff(instr)
+    
     # 1) instruction-targeted column (if any)
     targeted = pick_csv_column(df, instr)
     vals: list[float] = []
     if targeted:
         ser = pd.to_numeric(df[targeted], errors="coerce")
-        vals.append(float(ser.fillna(0).sum()))
+        if cutoff is not None:
+            ser = ser[ser > cutoff]
+        total = float(ser.fillna(0).sum())
+        if np.isfinite(total):
+            vals.append(total)
     # 2) per-column numeric sums
     for _, s in _numeric_col_sums(df):
-        vals.append(float(s))
-    # 3) whole-sheet sum as last resort
-    vals.append(float(df.apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy().sum()))
+        if cutoff is not None:
+            # Recompute with cutoff
+            continue  # Skip pre-computed sums, compute on-demand below
+        if np.isfinite(s):
+            vals.append(float(s))
+    # 3) whole-sheet sum
+    num_df = df.apply(pd.to_numeric, errors="coerce").fillna(0)
+    if cutoff is not None:
+        num_df = num_df[num_df > cutoff]
+    total = float(num_df.to_numpy().sum())
+    if np.isfinite(total):
+        vals.append(total)
+    
     # dedupe while keeping order
     seen = set(); uniq = []
     for v in vals:
@@ -298,14 +405,32 @@ async def enumerate_xlsx_candidates(url: str, deadline: float, instr: str) -> li
         r = await client.get(url); r.raise_for_status()
         buf = r.content
     df = await _load_xlsx_df(buf)
+    
+    # Extract cutoff if present
+    cutoff = extract_cutoff(instr)
+    
     targeted = pick_csv_column(df, instr)
     vals: list[float] = []
     if targeted:
         ser = pd.to_numeric(df[targeted], errors="coerce")
-        vals.append(float(ser.fillna(0).sum()))
+        if cutoff is not None:
+            ser = ser[ser > cutoff]
+        total = float(ser.fillna(0).sum())
+        if np.isfinite(total):
+            vals.append(total)
     for _, s in _numeric_col_sums(df):
-        vals.append(float(s))
-    vals.append(float(df.apply(pd.to_numeric, errors="coerce").fillna(0).to_numpy().sum()))
+        if cutoff is not None:
+            continue  # Skip pre-computed sums
+        if np.isfinite(s):
+            vals.append(float(s))
+    
+    num_df = df.apply(pd.to_numeric, errors="coerce").fillna(0)
+    if cutoff is not None:
+        num_df = num_df[num_df > cutoff]
+    total = float(num_df.to_numpy().sum())
+    if np.isfinite(total):
+        vals.append(total)
+    
     seen = set(); uniq = []
     for v in vals:
         if v not in seen:
@@ -327,9 +452,19 @@ async def csv_answer(url: str, deadline: float, instr: str, mode: str="best") ->
     if cols_str and all(re.fullmatch(r"\d+", c) for c in cols_str):
         df = pd.read_csv(io.BytesIO(buf), header=None)
 
+    # Check for cutoff/threshold in instructions
+    cutoff = extract_cutoff(instr)
+    
     if mode == "sum_all":
         num = df.apply(pd.to_numeric, errors="coerce")
-        return float(num.fillna(0).to_numpy().sum())
+        if cutoff is not None:
+            # Apply cutoff: only sum values > cutoff
+            num = num[num > cutoff]
+        total = float(num.fillna(0).to_numpy().sum())
+        # Handle NaN/Inf
+        if pd.isna(total) or not np.isfinite(total):
+            return 0.0
+        return total
 
     # best: infer a single column + agg
     col = pick_csv_column(df, instr)
@@ -340,9 +475,28 @@ async def csv_answer(url: str, deadline: float, instr: str, mode: str="best") ->
             if ser.notna().mean() > 0.6:
                 col = c; break
     if not col:
+        # If no column found but we have a cutoff, do whole-sheet sum with cutoff
+        if cutoff is not None:
+            num = df.apply(pd.to_numeric, errors="coerce")
+            num = num[num > cutoff]
+            total = float(num.fillna(0).to_numpy().sum())
+            if np.isfinite(total):
+                return total
         return None
+    
     agg = pick_csv_agg(instr)
-    return apply_agg(df[col], agg)
+    series = df[col]
+    
+    # Apply cutoff if specified
+    if cutoff is not None and agg == "sum":
+        series = pd.to_numeric(series, errors="coerce")
+        series = series[series > cutoff]
+    
+    result = apply_agg(series, agg)
+    # Handle NaN/Inf
+    if pd.isna(result) or not np.isfinite(result):
+        return 0.0
+    return result
 
 
 async def xlsx_answer(url: str, deadline: float, instr: str, mode: str="best") -> Any:
@@ -355,9 +509,18 @@ async def xlsx_answer(url: str, deadline: float, instr: str, mode: str="best") -
     if all(re.fullmatch(r"\d+", str(c).strip().lower()) for c in df.columns):
         df = pd.read_excel(io.BytesIO(buf), header=None)
 
+    # Check for cutoff/threshold in instructions
+    cutoff = extract_cutoff(instr)
+
     if mode == "sum_all":
         num = df.apply(pd.to_numeric, errors="coerce")
-        return float(num.fillna(0).to_numpy().sum())
+        if cutoff is not None:
+            # Apply cutoff: only sum values > cutoff
+            num = num[num > cutoff]
+        total = float(num.fillna(0).to_numpy().sum())
+        if pd.isna(total) or not np.isfinite(total):
+            return 0.0
+        return total
 
     col = pick_csv_column(df, instr)
     if not col:
@@ -366,15 +529,40 @@ async def xlsx_answer(url: str, deadline: float, instr: str, mode: str="best") -
             if ser.notna().mean() > 0.6:
                 col = c; break
     if not col:
+        # If no column found but we have a cutoff, do whole-sheet sum with cutoff
+        if cutoff is not None:
+            num = df.apply(pd.to_numeric, errors="coerce")
+            num = num[num > cutoff]
+            total = float(num.fillna(0).to_numpy().sum())
+            if np.isfinite(total):
+                return total
         return None
+    
     agg = pick_csv_agg(instr)
-    return apply_agg(df[col], agg)
+    series = df[col]
+    
+    # Apply cutoff if specified
+    if cutoff is not None and agg == "sum":
+        series = pd.to_numeric(series, errors="coerce")
+        series = series[series > cutoff]
+    
+    result = apply_agg(series, agg)
+    if pd.isna(result) or not np.isfinite(result):
+        return 0.0
+    return result
 
 
 async def compute_answer(page, text: str, html: str, decoded: str, deadline: float, retry: bool=False) -> Any:
     # bail out if almost out of time
     if time_left(deadline) < 5:
         return "timeout"
+
+    # A1) Check if instructions ask to scrape a page for a secret
+    current_url = await page.evaluate("location.href")
+    instr_combined = f"{decoded}\n{text}"
+    scrape_result = await check_scrape_task(current_url, instr_combined, deadline, page=page)
+    if scrape_result is not None:
+        return scrape_result
 
     # A) PDF on the page → sum "value" column on page 2
     # A) PDF link present
@@ -559,6 +747,25 @@ def pick_csv_agg(instructions: str) -> str:
     if re.search(r"\b(min(imum)?|smallest|lowest)\b", s): return "min"
     if re.search(r"\bcount\b", s):                return "count"
     return "sum"
+
+def extract_cutoff(instructions: str) -> Optional[float]:
+    """Extract cutoff/threshold value from instructions like 'Cutoff: 22129'"""
+    if not instructions:
+        return None
+    patterns = [
+        r"cutoff[^:\n]*[:\s]+(\d+(?:\.\d+)?)",
+        r"threshold[^:\n]*[:\s]+(\d+(?:\.\d+)?)",
+        r"above[^:\n]*[:\s]+(\d+(?:\.\d+)?)",
+        r"greater\s+than[^:\n]*[:\s]+(\d+(?:\.\d+)?)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, instructions, re.I)
+        if match:
+            try:
+                return float(match.group(1))
+            except Exception:
+                pass
+    return None
 
 def pick_csv_column(df: pd.DataFrame, instructions: str) -> Optional[str]:
     s = (instructions or "").lower()
